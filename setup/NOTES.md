@@ -34,8 +34,3 @@ sudo apt install code
 sudo iwlist wlan0 scan
 sudo nano /etc/wpa_supplicant/wpa_supplicant.conf
 ```
-
-## CAN 인터페이스 활성화 (can.py 실행 전)
-```bash
-sudo ip link set can0 up type can bitrate 500000   # 비트레이트는 STM32 설정과 맞출 것
-```

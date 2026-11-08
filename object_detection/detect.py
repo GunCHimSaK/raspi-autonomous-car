@@ -1,4 +1,4 @@
-
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
 """
 Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, webcam, streams, etc.
 
@@ -37,6 +37,21 @@ import sys
 from pathlib import Path
 
 import torch
+
+import socket
+
+import RPi.GPIO as GPIO
+import time
+
+TRIG = 23
+ECHO = 24
+
+GPIO.setwarnings(False)
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -82,7 +97,9 @@ def run(
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
+        soc=None
 ):
+    
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
@@ -115,10 +132,7 @@ def run(
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
-    warmup_size = [1 if pt or model.triton else bs, 3]
-    warmup_size.extend(imgsz)
-    model.warmup(imgsz=tuple(warmup_size))  # warmup
-
+    model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
@@ -156,6 +170,7 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            distance = 70 #measure_distance()
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -163,10 +178,14 @@ def run(
                 # Print results
                 for c in det[:, 5].unique():
                     n = (det[:, 5] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                    class_name = names[int(c)]  # 클래스 이름 가져오기
+                    send_detection_result(class_name, soc, distance)
+                    s += f"{n} {class_name}{'s' * (n > 1)}, "  # add to string
+                    
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
+                    
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -178,7 +197,10 @@ def run(
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
-                        save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+                        save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)       
+            else:
+                class_name = 'none'
+                send_detection_result(class_name, soc, distance)
 
             # Stream results
             im0 = annotator.result()
@@ -211,7 +233,7 @@ def run(
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
-
+    
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
@@ -256,12 +278,64 @@ def parse_opt():
     print_args(vars(opt))
     return opt
 
+def measure_distance():
+    pulse_start = 0  # pulse_start 초기화
+    pulse_end = 0  # pulse_end 초기화
+    
+    try:
+        # 초음파 센서 초기화
+        GPIO.output(TRIG, False)
+        time.sleep(0.2)
+
+        # 초음파 발신 시간 측정
+        GPIO.output(TRIG, True)
+        time.sleep(0.00001)
+        GPIO.output(TRIG, False)
+
+        pulse_start = time.time()  # pulse_start 초기화
+        pulse_end = time.time()  # pulse_end 초기화
+        
+        # 초음파 수신 시간 측정
+        while GPIO.input(ECHO) == 0:
+            pulse_start = time.time()
+        while GPIO.input(ECHO) == 1:
+            pulse_end = time.time()
+        
+        # 시간 차이를 이용하여 거리 계산 (음속: 34300 cm/s)
+        pulse_duration = pulse_end - pulse_start
+        distance = pulse_duration * 34300 / 2
+        return distance
+    except UnboundLocalError as e:
+        print(f"Error in measure_distance: {e}")
+        return 0  # 예외가 발생하면 거리를 0으로 설정하고 오류 메시지를 출력합니다.
+
+        
+
+def send_detection_result(result, soc, distance):
+    print(distance)
+    if distance > 15:
+        print(result)
+        if result in ['red', 'yellow', 'station']:
+            soc.send(b'1')
+            print('send 1')
+        else:
+            soc.send(b'0')
+            print('send 0')
+    else:
+        soc.send(b'1')
+        print('send 1')
 
 def main(opt):
+    host = '169.254.151.90'
+    port = 12345
+    soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    soc.connect((host, port))
+    soc.send(b'1')
     check_requirements(ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
-    run(**vars(opt))
+    run(**vars(opt), soc=soc)
 
 
 if __name__ == '__main__':
     opt = parse_opt()
     main(opt)
+
